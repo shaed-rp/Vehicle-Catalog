@@ -1,0 +1,2495 @@
+-- =====================================================
+-- COMPLETE NISSAN FLEET DATABASE DDL
+-- Combined and cleaned version of all DDL files
+-- =====================================================
+
+-- Drop existing views and tables if needed (for clean installation)
+DROP VIEW IF EXISTS vehicle_details_view CASCADE;
+DROP VIEW IF EXISTS vehicles_with_identifications CASCADE;
+DROP VIEW IF EXISTS vehicles_with_spec_number CASCADE;
+DROP VIEW IF EXISTS body_model_codes_decoded CASCADE;
+DROP VIEW IF EXISTS active_decode_rules CASCADE;
+DROP MATERIALIZED VIEW IF EXISTS vehicle_combinations CASCADE;
+
+-- =====================================================
+-- SECTION 1: BASE TABLES AND LOOKUPS
+-- =====================================================
+
+-- Makes table
+CREATE TABLE makes (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50) UNIQUE NOT NULL,
+    logo_url VARCHAR(500),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Models table
+CREATE TABLE models (
+    id SERIAL PRIMARY KEY,
+    make_id INTEGER NOT NULL REFERENCES makes(id) ON DELETE CASCADE,
+    name VARCHAR(50) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(make_id, name)
+);
+
+-- Model years table
+CREATE TABLE model_years (
+    id SERIAL PRIMARY KEY,
+    year INTEGER NOT NULL UNIQUE CHECK (year >= 1900 AND year <= 2100),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_model_years_year ON model_years(year);
+
+-- Trims table
+CREATE TABLE trims (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50) UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Body types table
+CREATE TABLE body_types (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50) UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Drive types table
+CREATE TABLE drive_types (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(10) UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- =====================================================
+-- SECTION 2: BODY MODEL CODES SYSTEM
+-- =====================================================
+
+-- Body model codes table
+CREATE TABLE body_model_codes (
+    id SERIAL PRIMARY KEY,
+    code INTEGER UNIQUE NOT NULL,
+    make_id INTEGER NOT NULL REFERENCES makes(id),
+    model_id INTEGER NOT NULL REFERENCES models(id),
+    description VARCHAR(255),
+    is_active BOOLEAN DEFAULT TRUE,
+    decoded_cache JSONB,
+    decoded_cache_updated_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(code, make_id)
+);
+
+CREATE INDEX idx_body_model_codes_code ON body_model_codes(code);
+CREATE INDEX idx_body_model_codes_make_id ON body_model_codes(make_id);
+CREATE INDEX idx_body_model_codes_model_id ON body_model_codes(model_id);
+CREATE INDEX idx_body_model_codes_active ON body_model_codes(is_active);
+
+COMMENT ON TABLE body_model_codes IS 'OEM-specific body model codes';
+COMMENT ON COLUMN body_model_codes.code IS 'Manufacturer-specific body model identifier';
+COMMENT ON COLUMN body_model_codes.decoded_cache IS 'Cached decoded information from rules engine';
+
+-- Body model decode rules table
+CREATE TABLE body_model_decode_rules (
+    id SERIAL PRIMARY KEY,
+    make_id INTEGER NOT NULL REFERENCES makes(id),
+    rule_name VARCHAR(100) NOT NULL,
+    rule_type VARCHAR(50) NOT NULL CHECK (rule_type IN ('range', 'pattern', 'exact', 'function')),
+    priority INTEGER DEFAULT 100,
+    conditions JSONB NOT NULL,
+    decode_logic JSONB NOT NULL,
+    is_active BOOLEAN DEFAULT TRUE,
+    effective_date DATE DEFAULT CURRENT_DATE,
+    expiration_date DATE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(make_id, rule_name),
+    CHECK (expiration_date IS NULL OR expiration_date >= effective_date)
+);
+
+CREATE INDEX idx_decode_rules_make_priority ON body_model_decode_rules(make_id, priority);
+CREATE INDEX idx_decode_rules_active ON body_model_decode_rules(is_active);
+CREATE INDEX idx_decode_rules_dates ON body_model_decode_rules(effective_date, expiration_date);
+
+-- =====================================================
+-- SECTION 3: VEHICLE IDENTIFICATION SYSTEM
+-- =====================================================
+
+-- Identification types lookup table
+CREATE TABLE identification_types (
+    id SERIAL PRIMARY KEY,
+    type_code VARCHAR(50) UNIQUE NOT NULL,
+    type_name VARCHAR(100) NOT NULL,
+    description TEXT,
+    is_system_generated BOOLEAN DEFAULT FALSE,
+    requires_unique BOOLEAN DEFAULT FALSE,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+COMMENT ON TABLE identification_types IS 'Lookup table for different types of vehicle identifiers';
+COMMENT ON COLUMN identification_types.type_code IS 'Code used in the system (e.g., VIN, spec_number, stock_number)';
+COMMENT ON COLUMN identification_types.is_system_generated IS 'Whether this ID type is generated by the system vs external';
+COMMENT ON COLUMN identification_types.requires_unique IS 'Whether this identifier type must be unique across all vehicles (only VIN=true)';
+
+-- =====================================================
+-- SECTION 4: MAIN VEHICLES TABLE
+-- =====================================================
+
+-- Main vehicles table
+CREATE TABLE vehicles (
+    id SERIAL PRIMARY KEY,
+    body_model_code_id INTEGER REFERENCES body_model_codes(id),
+    model_year_id INTEGER NOT NULL REFERENCES model_years(id),
+    make_id INTEGER NOT NULL REFERENCES makes(id),
+    model_id INTEGER NOT NULL REFERENCES models(id),
+    trim_id INTEGER NOT NULL REFERENCES trims(id),
+    body_type_id INTEGER NOT NULL REFERENCES body_types(id),
+    drive_type_id INTEGER NOT NULL REFERENCES drive_types(id),
+    primary_identification_id INTEGER, -- Will be added as FK later
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Create indexes for vehicles table
+CREATE INDEX idx_vehicles_model_year_id ON vehicles(model_year_id);
+CREATE INDEX idx_vehicles_model_id ON vehicles(model_id);
+CREATE INDEX idx_vehicles_make_id ON vehicles(make_id);
+CREATE INDEX idx_vehicles_body_model_code_id ON vehicles(body_model_code_id);
+CREATE INDEX idx_vehicles_composite_filter ON vehicles(model_year_id, make_id, model_id, body_type_id);
+
+-- Vehicle identifications table
+CREATE TABLE vehicle_identifications (
+    id SERIAL PRIMARY KEY,
+    vehicle_id INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+    identification_type_id INTEGER NOT NULL REFERENCES identification_types(id),
+    id_value VARCHAR(255) NOT NULL,
+    is_primary BOOLEAN DEFAULT FALSE,
+    issued_by VARCHAR(255),
+    issued_date TIMESTAMPTZ,
+    expiry_date TIMESTAMPTZ,
+    metadata JSONB,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(vehicle_id, identification_type_id, id_value),
+    CHECK (expiry_date IS NULL OR expiry_date >= issued_date)
+);
+
+CREATE INDEX idx_vehicle_identifications_vehicle_id ON vehicle_identifications(vehicle_id);
+CREATE INDEX idx_vehicle_identifications_type_id ON vehicle_identifications(identification_type_id);
+CREATE INDEX idx_vehicle_identifications_value ON vehicle_identifications(id_value);
+CREATE INDEX idx_vehicle_identifications_primary ON vehicle_identifications(is_primary) WHERE is_primary = TRUE;
+CREATE INDEX idx_vehicle_identifications_active ON vehicle_identifications(is_active) WHERE is_active = TRUE;
+
+CREATE UNIQUE INDEX idx_vehicle_identifications_one_primary_per_type
+ON vehicle_identifications(vehicle_id, identification_type_id)
+WHERE is_primary = TRUE;
+
+COMMENT ON TABLE vehicle_identifications IS 'Stores multiple identification numbers for each vehicle';
+COMMENT ON COLUMN vehicle_identifications.is_primary IS 'Indicates if this is the primary identifier of this type for the vehicle';
+COMMENT ON COLUMN vehicle_identifications.metadata IS 'Additional JSON data specific to this identifier';
+
+-- Now add the foreign key for primary_identification_id
+ALTER TABLE vehicles 
+ADD CONSTRAINT fk_vehicles_primary_identification 
+FOREIGN KEY (primary_identification_id) 
+REFERENCES vehicle_identifications(id) 
+ON DELETE SET NULL;
+
+CREATE INDEX idx_vehicles_primary_identification_id ON vehicles(primary_identification_id);
+
+-- =====================================================
+-- SECTION 5: PRICING AND INCENTIVES
+-- =====================================================
+
+-- Vehicle pricing table
+CREATE TABLE vehicle_pricing (
+    id SERIAL PRIMARY KEY,
+    vehicle_id INTEGER NOT NULL UNIQUE REFERENCES vehicles(id) ON DELETE CASCADE,
+    intro_msrp DECIMAL(10, 2) NOT NULL CHECK (intro_msrp > 0),
+    factory_dealer_invoice DECIMAL(10, 2) NOT NULL CHECK (factory_dealer_invoice > 0),
+    dealer_net DECIMAL(10, 2) NOT NULL CHECK (dealer_net > 0),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_vehicle_pricing_msrp ON vehicle_pricing(intro_msrp);
+CREATE INDEX idx_vehicle_pricing_amounts ON vehicle_pricing(intro_msrp, dealer_net);
+
+-- Incentive programs table
+CREATE TABLE incentive_programs (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    level INTEGER NOT NULL CHECK (level > 0),
+    description TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(name, level)
+);
+
+-- Vehicle incentives table
+CREATE TABLE vehicle_incentives (
+    id SERIAL PRIMARY KEY,
+    vehicle_id INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+    incentive_program_id INTEGER NOT NULL REFERENCES incentive_programs(id),
+    incentive_amount DECIMAL(10, 2) NOT NULL CHECK (incentive_amount >= 0),
+    effective_date DATE DEFAULT CURRENT_DATE,
+    expiration_date DATE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(vehicle_id, incentive_program_id),
+    CHECK (expiration_date IS NULL OR expiration_date >= effective_date)
+);
+
+CREATE INDEX idx_vehicle_incentives_dates ON vehicle_incentives(effective_date, expiration_date);
+CREATE INDEX idx_vehicle_incentives_amount ON vehicle_incentives(incentive_amount);
+CREATE INDEX idx_vehicle_incentives_vehicle_id ON vehicle_incentives(vehicle_id);
+CREATE INDEX idx_vehicle_incentives_composite ON vehicle_incentives(vehicle_id, incentive_program_id);
+
+-- =====================================================
+-- SECTION 6: GOVERNANCE TABLES
+-- =====================================================
+
+-- Model year makes relationship table
+CREATE TABLE model_year_makes (
+    id SERIAL PRIMARY KEY,
+    model_year_id INTEGER NOT NULL REFERENCES model_years(id) ON DELETE CASCADE,
+    make_id INTEGER NOT NULL REFERENCES makes(id) ON DELETE CASCADE,
+    is_active BOOLEAN DEFAULT TRUE,
+    effective_date DATE DEFAULT CURRENT_DATE,
+    expiration_date DATE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(model_year_id, make_id),
+    CHECK (expiration_date IS NULL OR expiration_date >= effective_date)
+);
+
+CREATE INDEX idx_model_year_makes_year ON model_year_makes(model_year_id);
+CREATE INDEX idx_model_year_makes_make ON model_year_makes(make_id);
+CREATE INDEX idx_model_year_makes_active ON model_year_makes(is_active) WHERE is_active = TRUE;
+
+COMMENT ON TABLE model_year_makes IS 'Governs which makes are available for each model year';
+
+-- Model year make models relationship table
+CREATE TABLE model_year_make_models (
+    id SERIAL PRIMARY KEY,
+    model_year_make_id INTEGER NOT NULL REFERENCES model_year_makes(id) ON DELETE CASCADE,
+    model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    is_active BOOLEAN DEFAULT TRUE,
+    launch_date DATE,
+    discontinue_date DATE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(model_year_make_id, model_id),
+    CHECK (discontinue_date IS NULL OR discontinue_date >= launch_date)
+);
+
+CREATE INDEX idx_model_year_make_models_parent ON model_year_make_models(model_year_make_id);
+CREATE INDEX idx_model_year_make_models_model ON model_year_make_models(model_id);
+CREATE INDEX idx_model_year_make_models_active ON model_year_make_models(is_active) WHERE is_active = TRUE;
+
+COMMENT ON TABLE model_year_make_models IS 'Governs which models are available for each make/year combination';
+
+-- Model year make model trims relationship table
+CREATE TABLE model_year_make_model_trims (
+    id SERIAL PRIMARY KEY,
+    model_year_make_model_id INTEGER NOT NULL REFERENCES model_year_make_models(id) ON DELETE CASCADE,
+    trim_id INTEGER NOT NULL REFERENCES trims(id) ON DELETE CASCADE,
+    is_active BOOLEAN DEFAULT TRUE,
+    trim_level_order INTEGER,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(model_year_make_model_id, trim_id)
+);
+
+CREATE INDEX idx_model_year_make_model_trims_parent ON model_year_make_model_trims(model_year_make_model_id);
+CREATE INDEX idx_model_year_make_model_trims_trim ON model_year_make_model_trims(trim_id);
+CREATE INDEX idx_model_year_make_model_trims_active ON model_year_make_model_trims(is_active) WHERE is_active = TRUE;
+
+COMMENT ON TABLE model_year_make_model_trims IS 'Governs which trims are available for each model/make/year combination';
+
+-- =====================================================
+-- SECTION 7: PHOTO SYSTEM
+-- =====================================================
+
+-- Photo types lookup table
+CREATE TABLE photo_types (
+    id SERIAL PRIMARY KEY,
+    type_code VARCHAR(50) UNIQUE NOT NULL,
+    type_name VARCHAR(100) NOT NULL,
+    description TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+COMMENT ON TABLE photo_types IS 'Types of photos (stock, actual, interior, exterior, etc.)';
+
+-- Photo view angles table
+CREATE TABLE photo_view_angles (
+    id SERIAL PRIMARY KEY,
+    angle_code VARCHAR(50) UNIQUE NOT NULL,
+    angle_name VARCHAR(100) NOT NULL,
+    description TEXT,
+    sort_order INTEGER DEFAULT 100,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Stock photos table for catalog images
+CREATE TABLE stock_photos (
+    id SERIAL PRIMARY KEY,
+    model_year_id INTEGER NOT NULL REFERENCES model_years(id),
+    make_id INTEGER NOT NULL REFERENCES makes(id),
+    model_id INTEGER NOT NULL REFERENCES models(id),
+    trim_id INTEGER REFERENCES trims(id),
+    body_type_id INTEGER REFERENCES body_types(id),
+    photo_type_id INTEGER NOT NULL REFERENCES photo_types(id),
+    view_angle_id INTEGER REFERENCES photo_view_angles(id),
+    url TEXT NOT NULL,
+    thumbnail_url TEXT,
+    cdn_url TEXT,
+    file_name VARCHAR(255),
+    file_size_bytes INTEGER,
+    width_px INTEGER,
+    height_px INTEGER,
+    mime_type VARCHAR(100),
+    is_primary BOOLEAN DEFAULT FALSE,
+    display_order INTEGER DEFAULT 100,
+    color_code VARCHAR(50),
+    color_name VARCHAR(100),
+    photographer VARCHAR(255),
+    copyright_info TEXT,
+    alt_text TEXT,
+    caption TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    valid_from DATE DEFAULT CURRENT_DATE,
+    valid_until DATE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(model_year_id, make_id, model_id, trim_id, photo_type_id, view_angle_id, color_code),
+    CHECK (valid_until IS NULL OR valid_until >= valid_from)
+);
+
+CREATE INDEX idx_stock_photos_year_make_model ON stock_photos(model_year_id, make_id, model_id);
+CREATE INDEX idx_stock_photos_trim ON stock_photos(trim_id) WHERE trim_id IS NOT NULL;
+CREATE INDEX idx_stock_photos_type ON stock_photos(photo_type_id);
+CREATE INDEX idx_stock_photos_primary ON stock_photos(is_primary) WHERE is_primary = TRUE;
+CREATE INDEX idx_stock_photos_active ON stock_photos(is_active) WHERE is_active = TRUE;
+CREATE INDEX idx_stock_photos_display_order ON stock_photos(display_order);
+
+COMMENT ON TABLE stock_photos IS 'Stock photos for vehicle catalog';
+COMMENT ON COLUMN stock_photos.trim_id IS 'NULL means photo applies to all trims of the model';
+COMMENT ON COLUMN stock_photos.color_code IS 'Manufacturer color code if photo is color-specific';
+
+-- Vehicle photos table for actual vehicle images
+CREATE TABLE vehicle_photos (
+    id SERIAL PRIMARY KEY,
+    vehicle_id INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+    photo_type_id INTEGER NOT NULL REFERENCES photo_types(id),
+    view_angle_id INTEGER REFERENCES photo_view_angles(id),
+    url TEXT NOT NULL,
+    thumbnail_url TEXT,
+    cdn_url TEXT,
+    file_name VARCHAR(255),
+    file_size_bytes INTEGER,
+    width_px INTEGER,
+    height_px INTEGER,
+    mime_type VARCHAR(100),
+    is_primary BOOLEAN DEFAULT FALSE,
+    display_order INTEGER DEFAULT 100,
+    taken_date TIMESTAMPTZ,
+    photographer VARCHAR(255),
+    location VARCHAR(255),
+    notes TEXT,
+    alt_text TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    is_approved BOOLEAN DEFAULT FALSE,
+    approved_by VARCHAR(255),
+    approved_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_vehicle_photos_vehicle ON vehicle_photos(vehicle_id);
+CREATE INDEX idx_vehicle_photos_type ON vehicle_photos(photo_type_id);
+CREATE INDEX idx_vehicle_photos_primary ON vehicle_photos(is_primary) WHERE is_primary = TRUE;
+CREATE INDEX idx_vehicle_photos_active_approved ON vehicle_photos(is_active, is_approved) 
+    WHERE is_active = TRUE AND is_approved = TRUE;
+
+-- Photo collections for grouping related photos
+CREATE TABLE photo_collections (
+    id SERIAL PRIMARY KEY,
+    collection_name VARCHAR(255) NOT NULL,
+    collection_type VARCHAR(50),
+    description TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE photo_collection_items (
+    id SERIAL PRIMARY KEY,
+    collection_id INTEGER NOT NULL REFERENCES photo_collections(id) ON DELETE CASCADE,
+    stock_photo_id INTEGER REFERENCES stock_photos(id) ON DELETE CASCADE,
+    vehicle_photo_id INTEGER REFERENCES vehicle_photos(id) ON DELETE CASCADE,
+    display_order INTEGER DEFAULT 100,
+    caption TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CHECK (
+        (stock_photo_id IS NOT NULL AND vehicle_photo_id IS NULL) OR
+        (stock_photo_id IS NULL AND vehicle_photo_id IS NOT NULL)
+    )
+);
+
+-- =====================================================
+-- SECTION 8: CACHE AND HELPER TABLES
+-- =====================================================
+
+-- Filter cache table
+CREATE TABLE IF NOT EXISTS filter_cache (
+    id SERIAL PRIMARY KEY,
+    cache_key VARCHAR(255) UNIQUE NOT NULL,
+    filter_data JSONB NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '1 hour'
+);
+
+-- =====================================================
+-- SECTION 9: TRIGGER FUNCTIONS
+-- =====================================================
+
+-- Create update trigger for updated_at columns
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Apply update triggers to all relevant tables
+CREATE TRIGGER update_vehicles_updated_at BEFORE UPDATE ON vehicles
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_vehicle_pricing_updated_at BEFORE UPDATE ON vehicle_pricing
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_body_model_codes_updated_at BEFORE UPDATE ON body_model_codes
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_decode_rules_updated_at BEFORE UPDATE ON body_model_decode_rules
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_identification_types_updated_at BEFORE UPDATE ON identification_types
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_vehicle_identifications_updated_at BEFORE UPDATE ON vehicle_identifications
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_model_year_makes_updated_at BEFORE UPDATE ON model_year_makes
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_model_year_make_models_updated_at BEFORE UPDATE ON model_year_make_models
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_model_year_make_model_trims_updated_at BEFORE UPDATE ON model_year_make_model_trims
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_photo_types_updated_at BEFORE UPDATE ON photo_types
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_stock_photos_updated_at BEFORE UPDATE ON stock_photos
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_vehicle_photos_updated_at BEFORE UPDATE ON vehicle_photos
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- =====================================================
+-- SECTION 10: SPECIALIZED TRIGGER FUNCTIONS
+-- =====================================================
+
+-- Function to enforce unique VIN constraint
+CREATE OR REPLACE FUNCTION enforce_unique_vin()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_type_code VARCHAR;
+    v_existing_count INTEGER;
+BEGIN
+    SELECT type_code INTO v_type_code
+    FROM identification_types
+    WHERE id = NEW.identification_type_id;
+    
+    IF v_type_code = 'vin' THEN
+        SELECT COUNT(*) INTO v_existing_count
+        FROM vehicle_identifications vi
+        WHERE vi.identification_type_id = NEW.identification_type_id
+        AND vi.id_value = NEW.id_value
+        AND vi.vehicle_id != NEW.vehicle_id
+        AND vi.is_active = TRUE;
+        
+        IF v_existing_count > 0 THEN
+            RAISE EXCEPTION 'VIN % already exists for another vehicle.', NEW.id_value;
+        END IF;
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER enforce_unique_vin_trigger
+BEFORE INSERT OR UPDATE ON vehicle_identifications
+FOR EACH ROW
+EXECUTE FUNCTION enforce_unique_vin();
+
+-- Function to update vehicle primary identification
+CREATE OR REPLACE FUNCTION update_vehicle_primary_identification()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.is_primary = TRUE AND (OLD.is_primary IS NULL OR OLD.is_primary = FALSE) THEN
+        UPDATE vehicles
+        SET primary_identification_id = NEW.id
+        WHERE id = NEW.vehicle_id;
+    ELSIF NEW.is_primary = FALSE AND OLD.is_primary = TRUE THEN
+        UPDATE vehicles
+        SET primary_identification_id = NULL
+        WHERE id = NEW.vehicle_id AND primary_identification_id = NEW.id;
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_update_vehicle_primary_identification
+AFTER UPDATE OF is_primary ON vehicle_identifications
+FOR EACH ROW
+EXECUTE FUNCTION update_vehicle_primary_identification();
+
+-- Function to handle INSERT of new primary identifications
+CREATE OR REPLACE FUNCTION insert_vehicle_primary_identification()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.is_primary = TRUE THEN
+        UPDATE vehicles
+        SET primary_identification_id = NEW.id
+        WHERE id = NEW.vehicle_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_insert_vehicle_primary_identification
+AFTER INSERT ON vehicle_identifications
+FOR EACH ROW
+WHEN (NEW.is_primary = TRUE)
+EXECUTE FUNCTION insert_vehicle_primary_identification();
+
+-- Governance check function for vehicles
+CREATE OR REPLACE FUNCTION check_vehicle_governance()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_year_make_id INTEGER;
+    v_year_make_model_id INTEGER;
+    v_year_make_model_trim_id INTEGER;
+BEGIN
+    SELECT id INTO v_year_make_id
+    FROM model_year_makes
+    WHERE model_year_id = NEW.model_year_id
+    AND make_id = NEW.make_id
+    AND is_active = TRUE;
+    
+    IF v_year_make_id IS NULL THEN
+        RAISE EXCEPTION 'Make % is not available for model year %',
+            (SELECT name FROM makes WHERE id = NEW.make_id),
+            (SELECT year FROM model_years WHERE id = NEW.model_year_id);
+    END IF;
+    
+    SELECT id INTO v_year_make_model_id
+    FROM model_year_make_models
+    WHERE model_year_make_id = v_year_make_id
+    AND model_id = NEW.model_id
+    AND is_active = TRUE;
+    
+    IF v_year_make_model_id IS NULL THEN
+        RAISE EXCEPTION 'Model % is not available for % %',
+            (SELECT name FROM models WHERE id = NEW.model_id),
+            (SELECT year FROM model_years WHERE id = NEW.model_year_id),
+            (SELECT name FROM makes WHERE id = NEW.make_id);
+    END IF;
+    
+    SELECT id INTO v_year_make_model_trim_id
+    FROM model_year_make_model_trims
+    WHERE model_year_make_model_id = v_year_make_model_id
+    AND trim_id = NEW.trim_id
+    AND is_active = TRUE;
+    
+    IF v_year_make_model_trim_id IS NULL THEN
+        RAISE EXCEPTION 'Trim % is not available for % % %',
+            (SELECT name FROM trims WHERE id = NEW.trim_id),
+            (SELECT year FROM model_years WHERE id = NEW.model_year_id),
+            (SELECT name FROM makes WHERE id = NEW.make_id),
+            (SELECT name FROM models WHERE id = NEW.model_id);
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER enforce_vehicle_governance
+BEFORE INSERT OR UPDATE ON vehicles
+FOR EACH ROW
+EXECUTE FUNCTION check_vehicle_governance();
+
+-- =====================================================
+-- SECTION 11: INITIAL DATA POPULATION
+-- =====================================================
+
+-- Insert makes
+INSERT INTO makes (name, logo_url) VALUES 
+    ('Nissan', 'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/oem-logos/nissan-logo-white.svg');
+
+-- Insert model years
+INSERT INTO model_years (year) VALUES (2024), (2025), (2026);
+
+-- Get the Nissan make_id for use in models
+DO $$
+DECLARE
+    nissan_id INTEGER;
+BEGIN
+    SELECT id INTO nissan_id FROM makes WHERE name = 'Nissan';
+    
+    -- Insert models
+    INSERT INTO models (make_id, name) VALUES
+        (nissan_id, 'Versa'),
+        (nissan_id, 'Sentra'),
+        (nissan_id, 'Altima'),
+        (nissan_id, 'LEAF'),
+        (nissan_id, 'Kicks'),
+        (nissan_id, 'Rogue'),
+        (nissan_id, 'Pathfinder'),
+        (nissan_id, 'Armada');
+END $$;
+
+-- Insert trims
+INSERT INTO trims (name) VALUES
+    ('S'), ('SV'), ('SR'), ('SL'), ('Platinum'),
+    ('S Plus'), ('SV Plus'), ('Rock Creek'),
+    ('EV S'), ('EV SV Plus')
+ON CONFLICT (name) DO NOTHING;
+
+-- Insert body types
+INSERT INTO body_types (name) VALUES
+    ('Sedan'), ('SUV'), ('Hatchback');
+
+-- Insert drive types
+INSERT INTO drive_types (name) VALUES
+    ('FWD'), ('AWD'), ('RWD');
+
+-- Insert incentive programs
+INSERT INTO incentive_programs (name, level, description) VALUES
+    ('OEM Fleet Incentive', 3, 'Level 3 fleet incentive program'),
+    ('OEM Fleet Incentive', 4, 'Level 4 fleet incentive program');
+
+-- Insert identification types
+INSERT INTO identification_types (type_code, type_name, description, is_system_generated, requires_unique) VALUES
+    ('spec_number', 'Specification Number', 'Manufacturer or dealer specification number', FALSE, FALSE),
+    ('vin', 'VIN', 'Vehicle Identification Number - globally unique', FALSE, TRUE),
+    ('stock_number', 'Stock Number', 'Dealer stock/inventory number', FALSE, FALSE),
+    ('asset_number', 'Asset Number', 'Fleet or company asset tracking number', FALSE, FALSE),
+    ('order_number', 'Order Number', 'Factory or dealer order number - multiple vehicles per order', FALSE, FALSE),
+    ('purchase_order', 'Purchase Order', 'Customer purchase order number - multiple vehicles per PO', FALSE, FALSE),
+    ('quote_number', 'Quote Number', 'Sales quote number - can cover multiple vehicles', FALSE, FALSE),
+    ('invoice_number', 'Invoice Number', 'Dealer or manufacturer invoice number - multiple vehicles per invoice', FALSE, FALSE),
+    ('internal_id', 'Internal ID', 'System-generated internal tracking ID', TRUE, FALSE);
+
+-- Insert photo types
+INSERT INTO photo_types (type_code, type_name, description) VALUES
+    ('stock_catalog', 'Stock Catalog Photo', 'Manufacturer stock photo for catalog use'),
+    ('stock_exterior', 'Stock Exterior Photo', 'Manufacturer exterior view'),
+    ('stock_interior', 'Stock Interior Photo', 'Manufacturer interior view'),
+    ('stock_360', 'Stock 360 View', 'Manufacturer 360-degree view'),
+    ('actual_exterior', 'Actual Exterior Photo', 'Photo of actual vehicle exterior'),
+    ('actual_interior', 'Actual Interior Photo', 'Photo of actual vehicle interior'),
+    ('actual_damage', 'Damage Photo', 'Photo documenting vehicle damage'),
+    ('actual_feature', 'Feature Photo', 'Photo highlighting specific feature');
+
+-- Insert photo view angles
+INSERT INTO photo_view_angles (angle_code, angle_name, sort_order) VALUES
+    ('front', 'Front View', 10),
+    ('front_quarter', 'Front 3/4 View', 20),
+    ('side', 'Side Profile', 30),
+    ('rear_quarter', 'Rear 3/4 View', 40),
+    ('rear', 'Rear View', 50),
+    ('interior_front', 'Interior Front Seats', 60),
+    ('interior_rear', 'Interior Rear Seats', 70),
+    ('interior_dashboard', 'Dashboard View', 80),
+    ('interior_cargo', 'Cargo Area', 90),
+    ('engine', 'Engine Bay', 100),
+    ('detail', 'Detail Shot', 110);
+
+-- =====================================================
+-- SECTION 12: VEHICLE DATA POPULATION
+-- =====================================================
+
+-- Insert all vehicles with pricing and incentives
+DO $$
+DECLARE
+    nissan_id INTEGER;
+    versa_id INTEGER;
+    sentra_id INTEGER;
+    altima_id INTEGER;
+    leaf_id INTEGER;
+    kicks_id INTEGER;
+    rogue_id INTEGER;
+    pathfinder_id INTEGER;
+    armada_id INTEGER;
+    
+    s_trim_id INTEGER;
+    sv_trim_id INTEGER;
+    sr_trim_id INTEGER;
+    sl_trim_id INTEGER;
+    platinum_trim_id INTEGER;
+    rock_creek_trim_id INTEGER;
+    ev_s_trim_id INTEGER;
+    ev_sv_plus_trim_id INTEGER;
+    
+    sedan_id INTEGER;
+    suv_id INTEGER;
+    hatchback_id INTEGER;
+    
+    fwd_id INTEGER;
+    awd_id INTEGER;
+    rwd_id INTEGER;
+    
+    level3_id INTEGER;
+    level4_id INTEGER;
+    
+    year_2025_id INTEGER;
+    vehicle_id INTEGER;
+    spec_type_id INTEGER;
+    body_code_id INTEGER;
+BEGIN
+    -- Get IDs for all lookup tables
+    SELECT id INTO nissan_id FROM makes WHERE name = 'Nissan';
+    SELECT id INTO year_2025_id FROM model_years WHERE year = 2025;
+    
+    -- Get model IDs
+    SELECT id INTO versa_id FROM models WHERE name = 'Versa' AND make_id = nissan_id;
+    SELECT id INTO sentra_id FROM models WHERE name = 'Sentra' AND make_id = nissan_id;
+    SELECT id INTO altima_id FROM models WHERE name = 'Altima' AND make_id = nissan_id;
+    SELECT id INTO leaf_id FROM models WHERE name = 'LEAF' AND make_id = nissan_id;
+    SELECT id INTO kicks_id FROM models WHERE name = 'Kicks' AND make_id = nissan_id;
+    SELECT id INTO rogue_id FROM models WHERE name = 'Rogue' AND make_id = nissan_id;
+    SELECT id INTO pathfinder_id FROM models WHERE name = 'Pathfinder' AND make_id = nissan_id;
+    SELECT id INTO armada_id FROM models WHERE name = 'Armada' AND make_id = nissan_id;
+    
+    -- Get trim IDs
+    SELECT id INTO s_trim_id FROM trims WHERE name = 'S';
+    SELECT id INTO sv_trim_id FROM trims WHERE name = 'SV';
+    SELECT id INTO sr_trim_id FROM trims WHERE name = 'SR';
+    SELECT id INTO sl_trim_id FROM trims WHERE name = 'SL';
+    SELECT id INTO platinum_trim_id FROM trims WHERE name = 'Platinum';
+    SELECT id INTO rock_creek_trim_id FROM trims WHERE name = 'Rock Creek';
+    SELECT id INTO ev_s_trim_id FROM trims WHERE name = 'EV S';
+    SELECT id INTO ev_sv_plus_trim_id FROM trims WHERE name = 'EV SV Plus';
+    
+    -- Get body type IDs
+    SELECT id INTO sedan_id FROM body_types WHERE name = 'Sedan';
+    SELECT id INTO suv_id FROM body_types WHERE name = 'SUV';
+    SELECT id INTO hatchback_id FROM body_types WHERE name = 'Hatchback';
+    
+    -- Get drive type IDs
+    SELECT id INTO fwd_id FROM drive_types WHERE name = 'FWD';
+    SELECT id INTO awd_id FROM drive_types WHERE name = 'AWD';
+    SELECT id INTO rwd_id FROM drive_types WHERE name = 'RWD';
+    
+    -- Get incentive program IDs
+    SELECT id INTO level3_id FROM incentive_programs WHERE level = 3;
+    SELECT id INTO level4_id FROM incentive_programs WHERE level = 4;
+    
+    -- Get spec_number type ID
+    SELECT id INTO spec_type_id FROM identification_types WHERE type_code = 'spec_number';
+
+    -- First, insert all body model codes
+    INSERT INTO body_model_codes (code, make_id, model_id, description)
+    VALUES
+        -- Versa codes
+        (10115, nissan_id, versa_id, 'Nissan Versa - Body Model 10115'),
+        (10215, nissan_id, versa_id, 'Nissan Versa - Body Model 10215'),
+        (10315, nissan_id, versa_id, 'Nissan Versa - Body Model 10315'),
+        -- Sentra codes
+        (12015, nissan_id, sentra_id, 'Nissan Sentra - Body Model 12015'),
+        (12115, nissan_id, sentra_id, 'Nissan Sentra - Body Model 12115'),
+        (12215, nissan_id, sentra_id, 'Nissan Sentra - Body Model 12215'),
+        -- Altima codes
+        (13115, nissan_id, altima_id, 'Nissan Altima - Body Model 13115'),
+        (13315, nissan_id, altima_id, 'Nissan Altima - Body Model 13315'),
+        (13515, nissan_id, altima_id, 'Nissan Altima - Body Model 13515'),
+        (13715, nissan_id, altima_id, 'Nissan Altima - Body Model 13715'),
+        (13215, nissan_id, altima_id, 'Nissan Altima - Body Model 13215'),
+        (13415, nissan_id, altima_id, 'Nissan Altima - Body Model 13415'),
+        (13615, nissan_id, altima_id, 'Nissan Altima - Body Model 13615'),
+        -- LEAF codes
+        (17015, nissan_id, leaf_id, 'Nissan LEAF - Body Model 17015'),
+        (17115, nissan_id, leaf_id, 'Nissan LEAF - Body Model 17115'),
+        -- Kicks codes
+        (21115, nissan_id, kicks_id, 'Nissan Kicks - Body Model 21115'),
+        (21315, nissan_id, kicks_id, 'Nissan Kicks - Body Model 21315'),
+        (21515, nissan_id, kicks_id, 'Nissan Kicks - Body Model 21515'),
+        (21015, nissan_id, kicks_id, 'Nissan Kicks - Body Model 21015'),
+        (21215, nissan_id, kicks_id, 'Nissan Kicks - Body Model 21215'),
+        (21415, nissan_id, kicks_id, 'Nissan Kicks - Body Model 21415'),
+        -- Rogue codes
+        (22115, nissan_id, rogue_id, 'Nissan Rogue - Body Model 22115'),
+        (22315, nissan_id, rogue_id, 'Nissan Rogue - Body Model 22315'),
+        (22515, nissan_id, rogue_id, 'Nissan Rogue - Body Model 22515'),
+        (22715, nissan_id, rogue_id, 'Nissan Rogue - Body Model 22715'),
+        (22015, nissan_id, rogue_id, 'Nissan Rogue - Body Model 22015'),
+        (22215, nissan_id, rogue_id, 'Nissan Rogue - Body Model 22215'),
+        (22615, nissan_id, rogue_id, 'Nissan Rogue - Body Model 22615'),
+        (22815, nissan_id, rogue_id, 'Nissan Rogue - Body Model 22815'),
+        -- Pathfinder codes
+        (25115, nissan_id, pathfinder_id, 'Nissan Pathfinder - Body Model 25115'),
+        (25315, nissan_id, pathfinder_id, 'Nissan Pathfinder - Body Model 25315'),
+        (25515, nissan_id, pathfinder_id, 'Nissan Pathfinder - Body Model 25515'),
+        (25715, nissan_id, pathfinder_id, 'Nissan Pathfinder - Body Model 25715'),
+        (25015, nissan_id, pathfinder_id, 'Nissan Pathfinder - Body Model 25015'),
+        (25215, nissan_id, pathfinder_id, 'Nissan Pathfinder - Body Model 25215'),
+        (25615, nissan_id, pathfinder_id, 'Nissan Pathfinder - Body Model 25615'),
+        (25815, nissan_id, pathfinder_id, 'Nissan Pathfinder - Body Model 25815'),
+        (25415, nissan_id, pathfinder_id, 'Nissan Pathfinder - Body Model 25415'),
+        -- Armada codes
+        (26115, nissan_id, armada_id, 'Nissan Armada - Body Model 26115'),
+        (26315, nissan_id, armada_id, 'Nissan Armada - Body Model 26315'),
+        (26515, nissan_id, armada_id, 'Nissan Armada - Body Model 26515'),
+        (26015, nissan_id, armada_id, 'Nissan Armada - Body Model 26015'),
+        (26215, nissan_id, armada_id, 'Nissan Armada - Body Model 26215'),
+        (26415, nissan_id, armada_id, 'Nissan Armada - Body Model 26415');
+
+    -- Insert Vehicle 1: 2025 Nissan Versa S
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 10115;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, versa_id, s_trim_id, sedan_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 20130.00, 19646.00, 18801.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 700.00), (vehicle_id, level4_id, 1100.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-1', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 2: 2025 Nissan Versa SV
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 10215;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, versa_id, sv_trim_id, sedan_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 21630.00, 21104.00, 20196.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 700.00), (vehicle_id, level4_id, 1100.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-2', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 3: 2025 Nissan Versa SR
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 10315;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, versa_id, sr_trim_id, sedan_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 22330.00, 21784.00, 20847.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 700.00), (vehicle_id, level4_id, 1100.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-3', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 4: 2025 Nissan Sentra S
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 12015;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, sentra_id, s_trim_id, sedan_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 22730.00, 21653.00, 20722.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 1200.00), (vehicle_id, level4_id, 1800.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-4', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 5: 2025 Nissan Sentra SV
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 12115;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, sentra_id, sv_trim_id, sedan_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 23430.00, 22317.00, 21357.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 1200.00), (vehicle_id, level4_id, 1800.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-5', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 6: 2025 Nissan Sentra SR
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 12215;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, sentra_id, sr_trim_id, sedan_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 25730.00, 24497.00, 23443.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 1200.00), (vehicle_id, level4_id, 1800.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-6', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 7: 2025 Nissan Altima S
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 13115;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, altima_id, s_trim_id, sedan_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 28140.00, 26301.00, 25170.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2100.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-7', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 8: 2025 Nissan Altima SV
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 13315;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, altima_id, sv_trim_id, sedan_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 28570.00, 26701.00, 25553.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2100.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-8', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 9: 2025 Nissan Altima SR
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 13515;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, altima_id, sr_trim_id, sedan_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 29970.00, 28004.00, 26799.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2100.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-9', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 10: 2025 Nissan Altima SL
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 13715;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, altima_id, sl_trim_id, sedan_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 34470.00, 32189.00, 30804.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2100.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-10', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 11: 2025 Nissan Altima SV AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 13215;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, altima_id, sv_trim_id, sedan_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 30070.00, 28096.00, 26888.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2100.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-11', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 12: 2025 Nissan Altima SR AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 13415;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, altima_id, sr_trim_id, sedan_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 31470.00, 29399.00, 28134.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2100.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-12', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 13: 2025 Nissan Altima SL AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 13615;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, altima_id, sl_trim_id, sedan_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 35970.00, 33584.00, 32139.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2100.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-13', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 14: 2025 Nissan LEAF EV S
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 17015;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, leaf_id, ev_s_trim_id, hatchback_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 29420.00, 27936.00, 26734.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 6300.00), (vehicle_id, level4_id, 7500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-14', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 15: 2025 Nissan LEAF EV SV Plus
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 17115;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, leaf_id, ev_sv_plus_trim_id, hatchback_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 37510.00, 35587.00, 34056.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 6300.00), (vehicle_id, level4_id, 7500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-15', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 16: 2025 Nissan Kicks S
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 21115;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, kicks_id, s_trim_id, suv_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 23220.00, 22428.00, 21474.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 1000.00), (vehicle_id, level4_id, 1500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-16', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 17: 2025 Nissan Kicks SV
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 21315;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, kicks_id, sv_trim_id, suv_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 25070.00, 24207.00, 23176.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 1000.00), (vehicle_id, level4_id, 1500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-17', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 18: 2025 Nissan Kicks SR
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 21515;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, kicks_id, sr_trim_id, suv_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 27570.00, 26610.00, 25476.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 1000.00), (vehicle_id, level4_id, 1500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-18', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 19: 2025 Nissan Kicks S AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 21015;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, kicks_id, s_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 24720.00, 23870.00, 22854.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 1000.00), (vehicle_id, level4_id, 1500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-19', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 20: 2025 Nissan Kicks SV AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 21215;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, kicks_id, sv_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 26720.00, 25793.00, 24694.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 1000.00), (vehicle_id, level4_id, 1500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-20', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 21: 2025 Nissan Kicks SR AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 21415;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, kicks_id, sr_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 29070.00, 28052.00, 26856.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 1000.00), (vehicle_id, level4_id, 1500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-21', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 22: 2025 Nissan Rogue S
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 22115;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, rogue_id, s_trim_id, suv_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 30620.00, 29053.00, 27814.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2600.00), (vehicle_id, level4_id, 3500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-22', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 23: 2025 Nissan Rogue SV
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 22315;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, rogue_id, sv_trim_id, suv_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 32360.00, 30697.00, 29387.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2600.00), (vehicle_id, level4_id, 3500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-23', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 24: 2025 Nissan Rogue SL
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 22515;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, rogue_id, sl_trim_id, suv_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 37480.00, 35533.00, 34015.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2600.00), (vehicle_id, level4_id, 3500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-24', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 25: 2025 Nissan Rogue Platinum
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 22715;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, rogue_id, platinum_trim_id, suv_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 40910.00, 38774.00, 37116.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2600.00), (vehicle_id, level4_id, 3500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-25', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 26: 2025 Nissan Rogue S AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 22015;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, rogue_id, s_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 32020.00, 30376.00, 29080.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2600.00), (vehicle_id, level4_id, 3500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-26', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 27: 2025 Nissan Rogue SV AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 22215;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, rogue_id, sv_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 33760.00, 32019.00, 30652.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2600.00), (vehicle_id, level4_id, 3500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-27', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 28: 2025 Nissan Rogue SL AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 22615;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, rogue_id, sl_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 38880.00, 36856.00, 35281.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2600.00), (vehicle_id, level4_id, 3500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-28', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 29: 2025 Nissan Rogue Platinum AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 22815;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, rogue_id, platinum_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 42310.00, 40097.00, 38382.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2600.00), (vehicle_id, level4_id, 3500.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-29', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 30: 2025 Nissan Pathfinder S
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 25115;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, pathfinder_id, s_trim_id, suv_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 38460.00, 35840.00, 34308.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 3400.00), (vehicle_id, level4_id, 4600.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-34', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 31: 2025 Nissan Pathfinder SV
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 25315;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, pathfinder_id, sv_trim_id, suv_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 41450.00, 38614.00, 36963.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 3400.00), (vehicle_id, level4_id, 4600.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-35', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 32: 2025 Nissan Pathfinder SL
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 25515;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, pathfinder_id, sl_trim_id, suv_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 44650.00, 41583.00, 39805.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 3400.00), (vehicle_id, level4_id, 4600.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-36', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 33: 2025 Nissan Pathfinder Platinum
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 25715;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, pathfinder_id, platinum_trim_id, suv_id, fwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 51200.00, 47661.00, 45621.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 3400.00), (vehicle_id, level4_id, 4600.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-37', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 34: 2025 Nissan Pathfinder S AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 25015;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, pathfinder_id, s_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 40460.00, 37695.00, 36084.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 3400.00), (vehicle_id, level4_id, 4600.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-38', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 35: 2025 Nissan Pathfinder SV AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 25215;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, pathfinder_id, sv_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 43450.00, 40469.00, 38739.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 3400.00), (vehicle_id, level4_id, 4600.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-39', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 36: 2025 Nissan Pathfinder SL AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 25615;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, pathfinder_id, sl_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 46650.00, 43440.00, 41581.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 3400.00), (vehicle_id, level4_id, 4600.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-40', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 37: 2025 Nissan Pathfinder Platinum AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 25815;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, pathfinder_id, platinum_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 53200.00, 49517.00, 47397.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 3400.00), (vehicle_id, level4_id, 4600.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-41', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 38: 2025 Nissan Pathfinder Rock Creek AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 25415;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, pathfinder_id, rock_creek_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 46550.00, 43347.00, 41492.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 3400.00), (vehicle_id, level4_id, 4600.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-42', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 39: 2025 Nissan Armada SV RWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 26115;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, armada_id, sv_trim_id, suv_id, rwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 58530.00, 54404.00, 51861.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2700.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-43', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 40: 2025 Nissan Armada SL RWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 26315;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, armada_id, sl_trim_id, suv_id, rwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 64980.00, 60377.00, 57550.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2700.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-44', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 41: 2025 Nissan Armada Platinum RWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 26515;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, armada_id, platinum_trim_id, suv_id, rwd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 71940.00, 66822.00, 63688.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2700.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-45', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 42: 2025 Nissan Armada SV AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 26015;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, armada_id, sv_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 61530.00, 57182.00, 54507.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2700.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-46', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 43: 2025 Nissan Armada SL AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 26215;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, armada_id, sl_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 67980.00, 63156.00, 60196.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2700.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-47', TRUE, 'Nissan', NOW());
+
+    -- Insert Vehicle 44: 2025 Nissan Armada Platinum AWD
+    SELECT id INTO body_code_id FROM body_model_codes WHERE code = 26415;
+    INSERT INTO vehicles (body_model_code_id, model_year_id, make_id, model_id, trim_id, body_type_id, drive_type_id)
+    VALUES (body_code_id, year_2025_id, nissan_id, armada_id, platinum_trim_id, suv_id, awd_id)
+    RETURNING id INTO vehicle_id;
+    
+    INSERT INTO vehicle_pricing (vehicle_id, intro_msrp, factory_dealer_invoice, dealer_net)
+    VALUES (vehicle_id, 74940.00, 69600.00, 66334.00);
+    
+    INSERT INTO vehicle_incentives (vehicle_id, incentive_program_id, incentive_amount)
+    VALUES (vehicle_id, level3_id, 2700.00), (vehicle_id, level4_id, 3000.00);
+    
+    INSERT INTO vehicle_identifications (vehicle_id, identification_type_id, id_value, is_primary, issued_by, issued_date)
+    VALUES (vehicle_id, spec_type_id, 'PN-48', TRUE, 'Nissan', NOW());
+
+END $;
+
+-- =====================================================
+-- SECTION 13: POPULATE GOVERNANCE TABLES
+-- =====================================================
+
+-- Populate governance tables from existing data
+INSERT INTO model_year_makes (model_year_id, make_id)
+SELECT DISTINCT v.model_year_id, v.make_id
+FROM vehicles v
+ORDER BY v.model_year_id, v.make_id;
+
+INSERT INTO model_year_make_models (model_year_make_id, model_id)
+SELECT DISTINCT mym.id, v.model_id
+FROM vehicles v
+JOIN model_year_makes mym ON v.model_year_id = mym.model_year_id AND v.make_id = mym.make_id
+ORDER BY mym.id, v.model_id;
+
+INSERT INTO model_year_make_model_trims (model_year_make_model_id, trim_id, trim_level_order)
+SELECT DISTINCT
+    mymm.id,
+    v.trim_id,
+    CASE t.name
+        WHEN 'S' THEN 1
+        WHEN 'S Plus' THEN 1
+        WHEN 'EV S' THEN 1
+        WHEN 'SV' THEN 2
+        WHEN 'SV Plus' THEN 2
+        WHEN 'EV SV Plus' THEN 2
+        WHEN 'SR' THEN 3
+        WHEN 'SL' THEN 4
+        WHEN 'Rock Creek' THEN 4
+        WHEN 'Platinum' THEN 5
+        ELSE 6
+    END
+FROM vehicles v
+JOIN model_year_makes mym ON v.model_year_id = mym.model_year_id AND v.make_id = mym.make_id
+JOIN model_year_make_models mymm ON mym.id = mymm.model_year_make_id AND v.model_id = mymm.model_id
+JOIN trims t ON v.trim_id = t.id
+ORDER BY mymm.id, trim_level_order, v.trim_id;
+
+-- =====================================================
+-- SECTION 14: NISSAN DECODING RULES
+-- =====================================================
+
+-- Insert Nissan decoding rules
+DO $
+DECLARE
+    nissan_id INTEGER;
+BEGIN
+    SELECT id INTO nissan_id FROM makes WHERE name = 'Nissan';
+    
+    -- Model Series Rules
+    INSERT INTO body_model_decode_rules (make_id, rule_name, rule_type, priority, conditions, decode_logic)
+    VALUES
+    (nissan_id, 'Versa Series', 'range', 10,
+     '{"min": 10000, "max": 10999}',
+     '{"series_code": 10, "series_name": "Versa", "vehicle_type": "Compact Sedan"}'),
+    
+    (nissan_id, 'Sentra Series', 'range', 10,
+     '{"min": 12000, "max": 12999}',
+     '{"series_code": 12, "series_name": "Sentra", "vehicle_type": "Compact Sedan"}'),
+    
+    (nissan_id, 'Altima Series', 'range', 10,
+     '{"min": 13000, "max": 13999}',
+     '{"series_code": 13, "series_name": "Altima", "vehicle_type": "Midsize Sedan"}'),
+    
+    (nissan_id, 'LEAF Series', 'range', 10,
+     '{"min": 17000, "max": 17999}',
+     '{"series_code": 17, "series_name": "LEAF", "vehicle_type": "Electric Vehicle", "powertrain": "BEV"}'),
+    
+    (nissan_id, 'Kicks Series', 'range', 10,
+     '{"min": 21000, "max": 21999}',
+     '{"series_code": 21, "series_name": "Kicks", "vehicle_type": "Subcompact SUV"}'),
+    
+    (nissan_id, 'Rogue Series', 'range', 10,
+     '{"min": 22000, "max": 22999}',
+     '{"series_code": 22, "series_name": "Rogue", "vehicle_type": "Compact SUV"}'),
+    
+    (nissan_id, 'Pathfinder Series', 'range', 10,
+     '{"min": 25000, "max": 25999}',
+     '{"series_code": 25, "series_name": "Pathfinder", "vehicle_type": "Midsize SUV"}'),
+    
+    (nissan_id, 'Armada Series', 'range', 10,
+     '{"min": 26000, "max": 26999}',
+     '{"series_code": 26, "series_name": "Armada", "vehicle_type": "Full-size SUV"}'),
+    
+    -- Trim Level Rules
+    (nissan_id, 'Trim Level Decoder', 'pattern', 20,
+     '{"pattern": "hundreds_digit"}',
+     '{"mapping": {
+        "0": {"trim_level": "Base", "trim_tier": 1},
+        "1": {"trim_level": "S/Standard", "trim_tier": 2},
+        "2": {"trim_level": "SV/Mid-Level", "trim_tier": 3},
+        "3": {"trim_level": "SR/Sport", "trim_tier": 4},
+        "4": {"trim_level": "Premium", "trim_tier": 5},
+        "5": {"trim_level": "SL/Luxury", "trim_tier": 6},
+        "6": {"trim_level": "Limited", "trim_tier": 7},
+        "7": {"trim_level": "Special Edition", "trim_tier": 8},
+        "8": {"trim_level": "Platinum", "trim_tier": 9}
+      }}'),
+    
+    -- Drivetrain Rules
+    (nissan_id, 'Drivetrain Decoder', 'pattern', 30,
+     '{"pattern": "last_two_digits"}',
+     '{"mapping": {
+        "15": {"drivetrain": "AWD", "drivetrain_code": "All-Wheel Drive"},
+        "14": {"drivetrain": "AWD", "drivetrain_code": "All-Wheel Drive"},
+        "16": {"drivetrain": "4WD", "drivetrain_code": "Four-Wheel Drive"}
+      },
+      "default": {"drivetrain": "FWD", "drivetrain_code": "Front-Wheel Drive"}}');
+END $;
+
+-- =====================================================
+-- SECTION 15: STOCK PHOTOS DATA
+-- =====================================================
+
+-- Helper function to add stock photos
+CREATE OR REPLACE FUNCTION add_stock_photo(
+    p_year INTEGER,
+    p_make_name VARCHAR,
+    p_model_name VARCHAR,
+    p_trim_name VARCHAR,
+    p_url TEXT,
+    p_photo_type VARCHAR DEFAULT 'stock_catalog',
+    p_view_angle VARCHAR DEFAULT 'front_quarter',
+    p_is_primary BOOLEAN DEFAULT FALSE,
+    p_alt_text TEXT DEFAULT NULL
+)
+RETURNS INTEGER AS $
+DECLARE
+    v_year_id INTEGER;
+    v_make_id INTEGER;
+    v_model_id INTEGER;
+    v_trim_id INTEGER;
+    v_photo_type_id INTEGER;
+    v_view_angle_id INTEGER;
+    v_photo_id INTEGER;
+    v_body_type_id INTEGER;
+BEGIN
+    -- Get IDs
+    SELECT id INTO v_year_id FROM model_years WHERE year = p_year;
+    SELECT id INTO v_make_id FROM makes WHERE name = p_make_name;
+    SELECT id INTO v_model_id FROM models WHERE name = p_model_name AND make_id = v_make_id;
+    SELECT id INTO v_trim_id FROM trims WHERE name = p_trim_name;
+    SELECT id INTO v_photo_type_id FROM photo_types WHERE type_code = p_photo_type;
+    SELECT id INTO v_view_angle_id FROM photo_view_angles WHERE angle_code = p_view_angle;
+    
+    -- Get body type from existing vehicle
+    SELECT DISTINCT body_type_id INTO v_body_type_id
+    FROM vehicles
+    WHERE model_year_id = v_year_id
+    AND make_id = v_make_id
+    AND model_id = v_model_id
+    LIMIT 1;
+    
+    -- Validate
+    IF v_year_id IS NULL THEN RAISE EXCEPTION 'Year % not found', p_year; END IF;
+    IF v_make_id IS NULL THEN RAISE EXCEPTION 'Make % not found', p_make_name; END IF;
+    IF v_model_id IS NULL THEN RAISE EXCEPTION 'Model % not found', p_model_name; END IF;
+    IF v_photo_type_id IS NULL THEN RAISE EXCEPTION 'Photo type % not found', p_photo_type; END IF;
+    
+    -- If setting as primary, unset other primary photos for this combination
+    IF p_is_primary THEN
+        UPDATE stock_photos
+        SET is_primary = FALSE
+        WHERE model_year_id = v_year_id
+        AND make_id = v_make_id
+        AND model_id = v_model_id
+        AND (trim_id = v_trim_id OR (trim_id IS NULL AND v_trim_id IS NULL))
+        AND photo_type_id = v_photo_type_id;
+    END IF;
+    
+    -- Insert the photo
+    INSERT INTO stock_photos (
+        model_year_id, make_id, model_id, trim_id, body_type_id,
+        photo_type_id, view_angle_id, url, is_primary, alt_text,
+        file_name
+    ) VALUES (
+        v_year_id, v_make_id, v_model_id, v_trim_id, v_body_type_id,
+        v_photo_type_id, v_view_angle_id, p_url, p_is_primary,
+        COALESCE(p_alt_text, p_year || ' ' || p_make_name || ' ' || p_model_name || ' ' || COALESCE(p_trim_name, '')),
+        -- Extract filename from URL
+        regexp_replace(p_url, '^.*/([\^/]+), '\1')
+    )
+    RETURNING id INTO v_photo_id;
+    
+    RETURN v_photo_id;
+END;
+$ LANGUAGE plpgsql;
+
+-- Insert all stock photos
+DO $
+BEGIN
+    -- Altima photos
+    PERFORM add_stock_photo(2025, 'Nissan', 'Altima', 'S',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/altima%20s.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Altima S - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Altima', 'SV',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/altima%20sv.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Altima SV - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Altima', 'SR',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/altima%20sr.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Altima SR - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Altima', 'SL',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/altima%20sl.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Altima SL - Front 3/4 View');
+    
+    -- Armada photos
+    PERFORM add_stock_photo(2025, 'Nissan', 'Armada', 'SV',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/armada%20s.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Armada SV - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Armada', 'SL',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/armada%20sl.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Armada SL - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Armada', 'Platinum',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/armada%20platinum.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Armada Platinum - Front 3/4 View');
+    
+    -- Kicks photos
+    PERFORM add_stock_photo(2025, 'Nissan', 'Kicks', 'S',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/kicks%20s.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Kicks S - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Kicks', 'SV',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/kicks%20sv.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Kicks SV - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Kicks', 'SR',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/kicks%20sr.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Kicks SR - Front 3/4 View');
+    
+    -- LEAF photos
+    PERFORM add_stock_photo(2025, 'Nissan', 'LEAF', 'EV S',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/LEAF%20s.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan LEAF EV S - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'LEAF', 'EV SV Plus',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/LEAF%20SV%20Plus.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan LEAF EV SV Plus - Front 3/4 View');
+    
+    -- Pathfinder photos
+    PERFORM add_stock_photo(2025, 'Nissan', 'Pathfinder', 'S',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/pathfinder%20s.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Pathfinder S - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Pathfinder', 'SV',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/pathfinder%20sv.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Pathfinder SV - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Pathfinder', 'SL',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/pathfinder%20sl.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Pathfinder SL - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Pathfinder', 'Rock Creek',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/pathfinder%20rock%20creek.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Pathfinder Rock Creek - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Pathfinder', 'Platinum',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/pathfinder%20platinum.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Pathfinder Platinum - Front 3/4 View');
+    
+    -- Rogue photos
+    PERFORM add_stock_photo(2025, 'Nissan', 'Rogue', 'S',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/rogue%20s.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Rogue S - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Rogue', 'SV',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/rogue%20sv.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Rogue SV - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Rogue', 'SL',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/rogue%20sl.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Rogue SL - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Rogue', 'Platinum',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/rogue%20platinum.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Rogue Platinum - Front 3/4 View');
+    
+    -- Sentra photos
+    PERFORM add_stock_photo(2025, 'Nissan', 'Sentra', 'S',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/sentra%20s.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Sentra S - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Sentra', 'SV',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/sentra%20sv.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Sentra SV - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Sentra', 'SR',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/sentra%20sr.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Sentra SR - Front 3/4 View');
+    
+    -- Versa photos
+    PERFORM add_stock_photo(2025, 'Nissan', 'Versa', 'S',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/versa%20s.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Versa S - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Versa', 'SV',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/versa%20sv.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Versa SV - Front 3/4 View');
+    
+    PERFORM add_stock_photo(2025, 'Nissan', 'Versa', 'SR',
+        'https://vmqwsttnqnlynxwrmeeg.supabase.co/storage/v1/object/public/stock-photos/versa%20sr.avif',
+        'stock_catalog', 'front_quarter', TRUE, '2025 Nissan Versa SR - Front 3/4 View');
+END $;
+
+-- =====================================================
+-- SECTION 16: CORE FUNCTIONS
+-- =====================================================
+
+-- Body model code decoding function
+CREATE OR REPLACE FUNCTION decode_body_model_code_flexible(
+    p_body_model_code INTEGER,
+    p_make_id INTEGER
+)
+RETURNS JSONB AS $
+DECLARE
+    v_result JSONB := '{}';
+    v_rule RECORD;
+    v_temp_result JSONB;
+    v_extracted_value INTEGER;
+BEGIN
+    -- Initialize with basic info
+    v_result := jsonb_build_object(
+        'original_code', p_body_model_code,
+        'make_id', p_make_id
+    );
+    
+    -- Apply all active rules in priority order
+    FOR v_rule IN
+        SELECT * FROM body_model_decode_rules
+        WHERE make_id = p_make_id
+        AND is_active = TRUE
+        AND (effective_date IS NULL OR effective_date <= CURRENT_DATE)
+        AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE)
+        ORDER BY priority, id
+    LOOP
+        v_temp_result := NULL;
+        
+        -- Apply rule based on type
+        CASE v_rule.rule_type
+            WHEN 'range' THEN
+                IF p_body_model_code >= (v_rule.conditions->>'min')::INTEGER
+                   AND p_body_model_code <= (v_rule.conditions->>'max')::INTEGER THEN
+                    v_temp_result := v_rule.decode_logic;
+                END IF;
+                
+            WHEN 'pattern' THEN
+                CASE v_rule.conditions->>'pattern'
+                    WHEN 'hundreds_digit' THEN
+                        v_extracted_value := (p_body_model_code % 1000) / 100;
+                    WHEN 'last_two_digits' THEN
+                        v_extracted_value := p_body_model_code % 100;
+                    WHEN 'thousands_digit' THEN
+                        v_extracted_value := p_body_model_code / 1000;
+                    ELSE
+                        v_extracted_value := NULL;
+                END CASE;
+                
+                IF v_extracted_value IS NOT NULL THEN
+                    IF v_rule.decode_logic->'mapping' ? v_extracted_value::TEXT THEN
+                        v_temp_result := v_rule.decode_logic->'mapping'->v_extracted_value::TEXT;
+                    ELSIF v_rule.decode_logic ? 'default' THEN
+                        v_temp_result := v_rule.decode_logic->'default';
+                    END IF;
+                END IF;
+                
+            WHEN 'exact' THEN
+                IF v_rule.conditions->'codes' ? p_body_model_code::TEXT THEN
+                    v_temp_result := v_rule.decode_logic;
+                END IF;
+                
+            WHEN 'function' THEN
+                v_temp_result := v_rule.decode_logic;
+        END CASE;
+        
+        IF v_temp_result IS NOT NULL THEN
+            v_result := v_result || v_temp_result;
+        END IF;
+    END LOOP;
+    
+    v_result := v_result || jsonb_build_object(
+        'decoded_at', NOW(),
+        'decoder_version', '1.0'
+    );
+    
+    RETURN v_result;
+END;
+$ LANGUAGE plpgsql;
+
+-- Function to refresh body code cache
+CREATE OR REPLACE FUNCTION refresh_body_code_cache(p_body_model_code_id INTEGER DEFAULT NULL)
+RETURNS VOID AS $
+BEGIN
+    IF p_body_model_code_id IS NULL THEN
+        UPDATE body_model_codes bmc
+        SET
+            decoded_cache = decode_body_model_code_flexible(bmc.code, bmc.make_id),
+            decoded_cache_updated_at = NOW()
+        WHERE is_active = TRUE;
+    ELSE
+        UPDATE body_model_codes bmc
+        SET
+            decoded_cache = decode_body_model_code_flexible(bmc.code, bmc.make_id),
+            decoded_cache_updated_at = NOW()
+        WHERE id = p_body_model_code_id;
+    END IF;
+END;
+$ LANGUAGE plpgsql;
+
+-- Refresh all body model code caches
+SELECT refresh_body_code_cache();
+
+-- Function to upsert vehicle identification
+CREATE OR REPLACE FUNCTION upsert_vehicle_identification(
+    p_vehicle_id INTEGER,
+    p_type_code VARCHAR,
+    p_id_value VARCHAR,
+    p_is_primary BOOLEAN DEFAULT FALSE,
+    p_issued_by VARCHAR DEFAULT NULL,
+    p_issued_date TIMESTAMPTZ DEFAULT NULL,
+    p_metadata JSONB DEFAULT NULL
+)
+RETURNS INTEGER AS $
+DECLARE
+    v_type_id INTEGER;
+    v_identification_id INTEGER;
+BEGIN
+    -- Get the identification type ID
+    SELECT id INTO v_type_id
+    FROM identification_types
+    WHERE type_code = p_type_code AND is_active = TRUE;
+    
+    IF v_type_id IS NULL THEN
+        RAISE EXCEPTION 'Identification type % not found or inactive', p_type_code;
+    END IF;
+    
+    -- If setting as primary, unset other primary identifiers of same type
+    IF p_is_primary THEN
+        UPDATE vehicle_identifications
+        SET is_primary = FALSE
+        WHERE vehicle_id = p_vehicle_id
+        AND identification_type_id = v_type_id
+        AND is_primary = TRUE;
+    END IF;
+    
+    -- Insert or update the identification
+    INSERT INTO vehicle_identifications (
+        vehicle_id,
+        identification_type_id,
+        id_value,
+        is_primary,
+        issued_by,
+        issued_date,
+        metadata
+    ) VALUES (
+        p_vehicle_id,
+        v_type_id,
+        p_id_value,
+        p_is_primary,
+        p_issued_by,
+        p_issued_date,
+        p_metadata
+    )
+    ON CONFLICT (vehicle_id, identification_type_id, id_value)
+    DO UPDATE SET
+        is_primary = EXCLUDED.is_primary,
+        issued_by = COALESCE(EXCLUDED.issued_by, vehicle_identifications.issued_by),
+        issued_date = COALESCE(EXCLUDED.issued_date, vehicle_identifications.issued_date),
+        metadata = COALESCE(vehicle_identifications.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb),
+        updated_at = NOW()
+    RETURNING id INTO v_identification_id;
+    
+    RETURN v_identification_id;
+END;
+$ LANGUAGE plpgsql;
+
+-- =====================================================
+-- SECTION 17: SEARCH AND FILTER FUNCTIONS
+-- =====================================================
+
+-- Get available years
+CREATE OR REPLACE FUNCTION get_available_years()
+RETURNS TABLE (
+    year_id INTEGER,
+    year INTEGER,
+    vehicle_count BIGINT
+) AS $
+BEGIN
+    RETURN QUERY
+    SELECT
+        my.id,
+        my.year,
+        COUNT(DISTINCT v.id)
+    FROM model_years my
+    JOIN vehicles v ON v.model_year_id = my.id
+    GROUP BY my.id, my.year
+    ORDER BY my.year DESC;
+END;
+$ LANGUAGE plpgsql;
+
+-- Get makes by year
+CREATE OR REPLACE FUNCTION get_makes_by_year(p_year_id INTEGER)
+RETURNS TABLE (
+    make_id INTEGER,
+    make_name VARCHAR,
+    vehicle_count BIGINT
+) AS $
+BEGIN
+    RETURN QUERY
+    SELECT
+        ma.id,
+        ma.name,
+        COUNT(DISTINCT v.id)
+    FROM makes ma
+    JOIN vehicles v ON v.make_id = ma.id
+    WHERE v.model_year_id = p_year_id
+    GROUP BY ma.id, ma.name
+    ORDER BY ma.name;
+END;
+$ LANGUAGE plpgsql;
+
+-- Get models by year and make
+CREATE OR REPLACE FUNCTION get_models_by_year_make(
+    p_year_id INTEGER,
+    p_make_id INTEGER
+)
+RETURNS TABLE (
+    model_id INTEGER,
+    model_name VARCHAR,
+    body_type VARCHAR,
+    vehicle_count BIGINT,
+    min_price DECIMAL,
+    max_price DECIMAL
+) AS $
+BEGIN
+    RETURN QUERY
+    SELECT
+        mo.id,
+        mo.name,
+        bt.name,
+        COUNT(DISTINCT v.id),
+        MIN(vp.intro_msrp),
+        MAX(vp.intro_msrp)
+    FROM models mo
+    JOIN vehicles v ON v.model_id = mo.id
+    JOIN body_types bt ON v.body_type_id = bt.id
+    LEFT JOIN vehicle_pricing vp ON v.id = vp.vehicle_id
+    WHERE v.model_year_id = p_year_id
+    AND v.make_id = p_make_id
+    GROUP BY mo.id, mo.name, bt.name
+    ORDER BY mo.name;
+END;
+$ LANGUAGE plpgsql;
+
+-- Get trim/drive options for specific model
+CREATE OR REPLACE FUNCTION get_trim_drive_options(
+    p_year_id INTEGER,
+    p_make_id INTEGER,
+    p_model_id INTEGER
+)
+RETURNS TABLE (
+    trim_id INTEGER,
+    trim_name VARCHAR,
+    drive_type_id INTEGER,
+    drive_type_name VARCHAR,
+    vehicle_id INTEGER,
+    primary_identification VARCHAR,
+    msrp DECIMAL,
+    invoice DECIMAL,
+    dealer_net DECIMAL,
+    level3_incentive DECIMAL,
+    level4_incentive DECIMAL
+) AS $
+BEGIN
+    RETURN QUERY
+    SELECT
+        t.id,
+        t.name,
+        dt.id,
+        dt.name,
+        v.id,
+        vi_ident.id_value,
+        vp.intro_msrp,
+        vp.factory_dealer_invoice,
+        vp.dealer_net,
+        MAX(CASE WHEN ip.level = 3 THEN vi.incentive_amount END),
+        MAX(CASE WHEN ip.level = 4 THEN vi.incentive_amount END)
+    FROM vehicles v
+    JOIN trims t ON v.trim_id = t.id
+    JOIN drive_types dt ON v.drive_type_id = dt.id
+    LEFT JOIN vehicle_pricing vp ON v.id = vp.vehicle_id
+    LEFT JOIN vehicle_incentives vi ON v.id = vi.vehicle_id
+    LEFT JOIN incentive_programs ip ON vi.incentive_program_id = ip.id
+    LEFT JOIN vehicle_identifications vi_ident ON v.primary_identification_id = vi_ident.id
+    WHERE v.model_year_id = p_year_id
+    AND v.make_id = p_make_id
+    AND v.model_id = p_model_id
+    GROUP BY
+        t.id, t.name,
+        dt.id, dt.name,
+        v.id, vi_ident.id_value,
+        vp.intro_msrp, vp.factory_dealer_invoice, vp.dealer_net
+    ORDER BY t.name, dt.name;
+END;
+$ LANGUAGE plpgsql;
+
+-- Search vehicles function
+CREATE OR REPLACE FUNCTION search_vehicles(
+    p_year_id INTEGER DEFAULT NULL,
+    p_make_id INTEGER DEFAULT NULL,
+    p_model_id INTEGER DEFAULT NULL,
+    p_trim_id INTEGER DEFAULT NULL,
+    p_drive_type_id INTEGER DEFAULT NULL,
+    p_body_type_id INTEGER DEFAULT NULL,
+    p_body_model_code_id INTEGER DEFAULT NULL,
+    p_min_price DECIMAL DEFAULT NULL,
+    p_max_price DECIMAL DEFAULT NULL,
+    p_incentive_level INTEGER DEFAULT NULL
+)
+RETURNS TABLE (
+    vehicle_id INTEGER,
+    year INTEGER,
+    make VARCHAR,
+    model VARCHAR,
+    trim_name VARCHAR,
+    drive_type VARCHAR,
+    body_type VARCHAR,
+    body_model_code INTEGER,
+    body_model_info JSONB,
+    primary_identification VARCHAR,
+    msrp DECIMAL,
+    invoice DECIMAL,
+    dealer_net DECIMAL,
+    incentive_amount DECIMAL,
+    effective_price DECIMAL
+) AS $
+BEGIN
+    RETURN QUERY
+    SELECT
+        v.id,
+        my.year,
+        ma.name,
+        mo.name,
+        t.name,
+        dt.name,
+        bt.name,
+        bmc.code,
+        bmc.decoded_cache,
+        vi_ident.id_value,
+        vp.intro_msrp,
+        vp.factory_dealer_invoice,
+        vp.dealer_net,
+        COALESCE(
+            MAX(CASE
+                WHEN p_incentive_level IS NULL OR ip.level = p_incentive_level
+                THEN vi.incentive_amount
+            END), 0
+        ),
+        vp.dealer_net - COALESCE(
+            MAX(CASE
+                WHEN p_incentive_level IS NULL OR ip.level = p_incentive_level
+                THEN vi.incentive_amount
+            END), 0
+        )
+    FROM vehicles v
+    JOIN model_years my ON v.model_year_id = my.id
+    JOIN makes ma ON v.make_id = ma.id
+    JOIN models mo ON v.model_id = mo.id
+    JOIN trims t ON v.trim_id = t.id
+    JOIN drive_types dt ON v.drive_type_id = dt.id
+    JOIN body_types bt ON v.body_type_id = bt.id
+    LEFT JOIN body_model_codes bmc ON v.body_model_code_id = bmc.id
+    LEFT JOIN vehicle_pricing vp ON v.id = vp.vehicle_id
+    LEFT JOIN vehicle_incentives vi ON v.id = vi.vehicle_id
+    LEFT JOIN incentive_programs ip ON vi.incentive_program_id = ip.id
+    LEFT JOIN vehicle_identifications vi_ident ON v.primary_identification_id = vi_ident.id
+    WHERE
+        (p_year_id IS NULL OR v.model_year_id = p_year_id)
+        AND (p_make_id IS NULL OR v.make_id = p_make_id)
+        AND (p_model_id IS NULL OR v.model_id = p_model_id)
+        AND (p_trim_id IS NULL OR v.trim_id = p_trim_id)
+        AND (p_drive_type_id IS NULL OR v.drive_type_id = p_drive_type_id)
+        AND (p_body_type_id IS NULL OR v.body_type_id = p_body_type_id)
+        AND (p_body_model_code_id IS NULL OR v.body_model_code_id = p_body_model_code_id)
+        AND (p_min_price IS NULL OR vp.intro_msrp >= p_min_price)
+        AND (p_max_price IS NULL OR vp.intro_msrp <= p_max_price)
+    GROUP BY
+        v.id, my.year, ma.name, mo.name, t.name, dt.name, bt.name,
+        bmc.code, bmc.decoded_cache, vi_ident.id_value, vp.intro_msrp,
+        vp.factory_dealer_invoice, vp.dealer_net
+    ORDER BY my.year DESC, ma.name, mo.name, vp.intro_msrp;
+END;
+$ LANGUAGE plpgsql;
+
+-- Get vehicle photos function
+CREATE OR REPLACE FUNCTION get_vehicle_photos(
+    p_vehicle_id INTEGER
+)
+RETURNS TABLE (
+    photo_id INTEGER,
+    photo_source VARCHAR,
+    photo_type VARCHAR,
+    view_angle VARCHAR,
+    url TEXT,
+    thumbnail_url TEXT,
+    is_primary BOOLEAN,
+    display_order INTEGER,
+    alt_text TEXT,
+    color_name VARCHAR
+) AS $
+BEGIN
+    -- Get actual photos for this specific vehicle
+    RETURN QUERY
+    SELECT
+        vp.id,
+        'actual'::VARCHAR,
+        pt.type_name,
+        pva.angle_name,
+        vp.url,
+        vp.thumbnail_url,
+        vp.is_primary,
+        vp.display_order,
+        vp.alt_text,
+        NULL::VARCHAR
+    FROM vehicle_photos vp
+    JOIN photo_types pt ON vp.photo_type_id = pt.id
+    LEFT JOIN photo_view_angles pva ON vp.view_angle_id = pva.id
+    WHERE vp.vehicle_id = p_vehicle_id
+    AND vp.is_active = TRUE
+    AND vp.is_approved = TRUE;
+    
+    -- Get stock photos that match this vehicle's configuration
+    RETURN QUERY
+    SELECT
+        sp.id,
+        'stock'::VARCHAR,
+        pt.type_name,
+        pva.angle_name,
+        sp.url,
+        sp.thumbnail_url,
+        sp.is_primary,
+        sp.display_order,
+        sp.alt_text,
+        sp.color_name
+    FROM vehicles v
+    JOIN stock_photos sp ON
+        sp.model_year_id = v.model_year_id
+        AND sp.make_id = v.make_id
+        AND sp.model_id = v.model_id
+        AND (sp.trim_id = v.trim_id OR sp.trim_id IS NULL)
+    JOIN photo_types pt ON sp.photo_type_id = pt.id
+    LEFT JOIN photo_view_angles pva ON sp.view_angle_id = pva.id
+    WHERE v.id = p_vehicle_id
+    AND sp.is_active = TRUE
+    AND NOT EXISTS (
+        SELECT 1 FROM vehicle_photos vp2
+        WHERE vp2.vehicle_id = p_vehicle_id
+        AND vp2.photo_type_id = sp.photo_type_id
+        AND vp2.is_active = TRUE
+        AND vp2.is_approved = TRUE
+    )
+    ORDER BY display_order, photo_type;
+END;
+$ LANGUAGE plpgsql;
+
+-- =====================================================
+-- SECTION 18: MATERIALIZED VIEWS
+-- =====================================================
+
+-- Create materialized view for vehicle combinations
+CREATE MATERIALIZED VIEW vehicle_combinations AS
+SELECT DISTINCT
+    my.id as model_year_id,
+    my.year as model_year,
+    ma.id as make_id,
+    ma.name as make,
+    mo.id as model_id,
+    mo.name as model,
+    t.id as trim_id,
+    t.name as trim,
+    dt.id as drive_type_id,
+    dt.name as drive_type,
+    bt.id as body_type_id,
+    bt.name as body_type,
+    COUNT(v.id) as vehicle_count,
+    MIN(vp.intro_msrp) as min_price,
+    MAX(vp.intro_msrp) as max_price
+FROM vehicles v
+JOIN model_years my ON v.model_year_id = my.id
+JOIN makes ma ON v.make_id = ma.id
+JOIN models mo ON v.model_id = mo.id
+JOIN trims t ON v.trim_id = t.id
+JOIN body_types bt ON v.body_type_id = bt.id
+JOIN drive_types dt ON v.drive_type_id = dt.id
+LEFT JOIN vehicle_pricing vp ON v.id = vp.vehicle_id
+GROUP BY
+    my.id, my.year,
+    ma.id, ma.name,
+    mo.id, mo.name,
+    t.id, t.name,
+    dt.id, dt.name,
+    bt.id, bt.name;
+
+-- Create indexes for the materialized view
+CREATE INDEX idx_vehicle_combinations_year_make_model
+ON vehicle_combinations(model_year_id, make_id, model_id);
+
+CREATE INDEX idx_vehicle_combinations_body_type
+ON vehicle_combinations(body_type_id);
+
+CREATE UNIQUE INDEX idx_vehicle_combinations_unique
+ON vehicle_combinations (
+    model_year_id, make_id, model_id, trim_id,
+    drive_type_id, body_type_id
+);
+
+-- Refresh function for materialized view
+CREATE OR REPLACE FUNCTION refresh_vehicle_combinations()
+RETURNS void AS $
+BEGIN
+    REFRESH MATERIALIZED VIEW CONCURRENTLY vehicle_combinations;
+END;
+$ LANGUAGE plpgsql;
+
+-- =====================================================
+-- SECTION 19: MAIN VEHICLE DETAILS VIEW
+-- =====================================================
+
+CREATE VIEW vehicle_details_view AS
+SELECT
+    v.id,
+    -- Get primary identification value
+    vi_primary.id_value AS primary_identification,
+    -- Get primary identification type
+    it_primary.type_code AS primary_identification_type,
+    -- Get VIN if exists
+    (SELECT vi.id_value
+     FROM vehicle_identifications vi
+     JOIN identification_types it ON vi.identification_type_id = it.id
+     WHERE vi.vehicle_id = v.id
+     AND it.type_code = 'vin'
+     LIMIT 1) AS vin,
+    -- Get all identifications as JSON
+    (SELECT jsonb_agg(jsonb_build_object(
+        'type', it.type_code,
+        'value', vi.id_value,
+        'is_primary', vi.is_primary,
+        'issued_by', vi.issued_by,
+        'issued_date', vi.issued_date
+     ) ORDER BY vi.is_primary DESC, it.type_code)
+     FROM vehicle_identifications vi
+     JOIN identification_types it ON vi.identification_type_id = it.id
+     WHERE vi.vehicle_id = v.id
+     AND vi.is_active = TRUE
+    ) AS identifications,
+    -- Get primary photo URL
+    COALESCE(
+        -- First try actual vehicle photo
+        (SELECT vp.url FROM vehicle_photos vp
+         WHERE vp.vehicle_id = v.id
+         AND vp.is_primary = TRUE
+         AND vp.is_active = TRUE
+         AND vp.is_approved = TRUE
+         LIMIT 1),
+        -- Then try stock photo
+        (SELECT sp.url FROM stock_photos sp
+         WHERE sp.model_year_id = v.model_year_id
+         AND sp.make_id = v.make_id
+         AND sp.model_id = v.model_id
+         AND (sp.trim_id = v.trim_id OR sp.trim_id IS NULL)
+         AND sp.is_primary = TRUE
+         AND sp.is_active = TRUE
+         ORDER BY sp.trim_id DESC NULLS LAST
+         LIMIT 1)
+    ) AS primary_photo_url,
+    -- Photo counts
+    (SELECT COUNT(*) FROM vehicle_photos vp
+     WHERE vp.vehicle_id = v.id
+     AND vp.is_active = TRUE
+     AND vp.is_approved = TRUE) AS actual_photo_count,
+    (SELECT COUNT(*) FROM stock_photos sp
+     WHERE sp.model_year_id = v.model_year_id
+     AND sp.make_id = v.make_id
+     AND sp.model_id = v.model_id
+     AND (sp.trim_id = v.trim_id OR sp.trim_id IS NULL)
+     AND sp.is_active = TRUE) AS stock_photo_count,
+    bmc.code AS body_model,
+    bmc.description AS body_model_description,
+    bmc.decoded_cache AS body_model_info,
+    my.year AS model_year,
+    ma.name AS make,
+    ma.logo_url AS make_logo_url,
+    mo.name AS model,
+    t.name AS trim,
+    bt.name AS body_type,
+    dt.name AS drive_type,
+    vp.intro_msrp,
+    vp.factory_dealer_invoice,
+    vp.dealer_net,
+    v.created_at,
+    v.updated_at
+FROM vehicles v
+JOIN model_years my ON v.model_year_id = my.id
+JOIN makes ma ON v.make_id = ma.id
+JOIN models mo ON v.model_id = mo.id
+JOIN trims t ON v.trim_id = t.id
+JOIN body_types bt ON v.body_type_id = bt.id
+JOIN drive_types dt ON v.drive_type_id = dt.id
+LEFT JOIN body_model_codes bmc ON v.body_model_code_id = bmc.id
+LEFT JOIN vehicle_pricing vp ON v.id = vp.vehicle_id
+LEFT JOIN vehicle_identifications vi_primary ON v.primary_identification_id = vi_primary.id
+LEFT JOIN identification_types it_primary ON vi_primary.identification_type_id = it_primary.id;
+
+-- =====================================================
+-- SECTION 20: VERIFICATION QUERIES
+-- =====================================================
+
+-- Final verification
+SELECT 'Database Creation Complete!' as status;
+
+-- Show summary counts
+SELECT 'Summary of Data' as category, '' as detail, 0 as count
+UNION ALL
+SELECT 'Vehicles', '', COUNT(*) FROM vehicles
+UNION ALL
+SELECT 'Makes', '', COUNT(*) FROM makes
+UNION ALL
+SELECT 'Models', '', COUNT(*) FROM models
+UNION ALL
+SELECT 'Model Years', '', COUNT(*) FROM model_years
+UNION ALL
+SELECT 'Trims', '', COUNT(*) FROM trims
+UNION ALL
+SELECT 'Body Types', '', COUNT(*) FROM body_types
+UNION ALL
+SELECT 'Drive Types', '', COUNT(*) FROM drive_types
+UNION ALL
+SELECT 'Stock Photos', '', COUNT(*) FROM stock_photos
+UNION ALL
+SELECT 'Identification Types', '', COUNT(*) FROM identification_types
+UNION ALL
+SELECT 'Vehicle Identifications', '', COUNT(*) FROM vehicle_identifications
+UNION ALL
+SELECT 'Incentive Programs', '', COUNT(*) FROM incentive_programs
+UNION ALL
+SELECT 'Vehicle Incentives', '', COUNT(*) FROM vehicle_incentives;
+
+-- Sample vehicle details
+SELECT 
+    primary_identification,
+    model_year,
+    make,
+    model,
+    trim,
+    drive_type,
+    intro_msrp,
+    primary_photo_url IS NOT NULL as has_photo
+FROM vehicle_details_view
+LIMIT 5;
